@@ -7,6 +7,11 @@ from pyqubo import solve_qubo
 from scipy.optimize import minimize
 from tqdm import tqdm
 
+from qiskit import transpile
+from qiskit_ibm_runtime import QiskitRuntimeService, Session
+from qiskit_ibm_runtime import EstimatorV2 as Estimator
+from qiskit_ibm_runtime import SamplerV2 as Sampler
+
 def load_dataset():
     """
     Load dataset and return related parameters.
@@ -346,11 +351,96 @@ def run_qaoa(hamiltonian_c, hamiltonian_m, initial_guess, reps=3, maxiter=200, t
     print("\nTop 3 measurement results (Big Endian):")
     for bitstring, count in sorted_counts[:3]:
         print(f"Bitstring: {bitstring[::-1]}, Measurement count: {count}")
+    print("\n")
     
     return {
         'simulation_result': simulation_result,
         'best_parameters': simulation_result['x'],
         'measurement_counts': counts_sim
+    }
+
+def run_qaoa_on_real_quantum_device(backend, hamiltonian_c, hamiltonian_m, initial_guess, reps=3, maxiter=200, tol=1e-4, rhobeg=1.0):
+    """
+    Run QAOA algorithm and return optimization results.
+    
+    Args:
+        hamiltonian_c (SparsePauliOp): Cost Hamiltonian.
+        hamiltonian_m (SparsePauliOp): Mixer Hamiltonian.
+        offset (float): Hamiltonian offset.
+        qubo_matrix (np.ndarray): QUBO matrix.
+        parameters (dict): QUBO configuration parameters.
+        reps (int): Number of QAOA repetitions.
+        maxiter (int): Maximum number of optimization iterations.
+        tol (float): Optimization tolerance.
+    
+    Returns:
+        dict: Optimization results and simulation results.
+    """
+    
+    # Initialize optimization
+    print("-------------------------------------------------")
+    print("-------- Run QAOA by real quantum device --------")
+    print("-------------------------------------------------")
+
+    ansatz = build_ansatz(hamiltonian_c, hamiltonian_m, reps) # Build QAOA Ansatz
+
+    basis_gates = backend.configuration().basis_gates
+    transpile_options = {
+        'optimization_level': 3,
+    }
+    print("---- Transpiling ansatz and observable ----")
+    transpiled_ansatz = transpile(ansatz, backend=backend, basis_gates=basis_gates, **transpile_options)
+    transpiled_observable = hamiltonian_c.apply_layout(transpiled_ansatz.layout)
+    print("---- Transpiling finished ----\n")
+
+    print("initial_guess")
+    print(initial_guess, "\n")
+    print("---- optimization process started. ----")
+
+    with Session(backend=backend) as session:
+        estimator = Estimator(mode=session)
+        # Set callback
+        callback = OptCallback(maxiter)
+        callback.set_components(transpiled_ansatz, transpiled_observable, estimator)
+
+        estimation_result = minimize(
+            fun=cost_func_qaoa,
+            x0=initial_guess,
+            args=(transpiled_ansatz, transpiled_observable, estimator),
+            method='COBYLA',
+            options={'maxiter': maxiter, 'tol': tol, 'disp': True, 'rhobeg': rhobeg},
+            callback=callback
+        )
+
+    # Close progress bar
+    callback.pbar.close()
+    
+    print("---- Optimization process finished. ----\n") 
+    print("estimation_result")
+    print(estimation_result)
+    print("\n")
+    
+    print("--- Real quantum device sampling of ansatz with optimized parameters ---")
+    # Optimized ansatz
+    best_ansatz = transpiled_ansatz.assign_parameters(estimation_result['x'])
+    best_ansatz.measure_all()
+    
+    # Real quantum device sampling
+    shots = 1000
+    sampler = Sampler(mode=backend)
+    job = sampler.run([best_ansatz], shots=shots)
+    data_pub = job.result()[0].data
+    counts = data_pub.meas.get_counts()
+    
+    sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    print("\nTop 3 measurement results (Big Endian):")
+    for bitstring, count in sorted_counts[:3]:
+        print(f"Bitstring: {bitstring[::-1]}, Measurement count: {count}")
+    
+    return {
+        'estimation_result': estimation_result,
+        'best_parameters': estimation_result['x'],
+        'measurement_counts': counts
     }
 
 def main():
@@ -418,10 +508,24 @@ def main():
     tol = 1e-4  # Optimization tolerance
     rhobeg = 1.0  # Initial step size
     initial_guess = np.random.uniform(-2*np.pi, 2*np.pi, size=reps*2)
-    optimization_results = run_qaoa(hamiltonian_c=hamiltonian_c, hamiltonian_m=hamiltonian_m, initial_guess=initial_guess
+    # initial_guess = np.array([3.55380618,  2.07659936,  5.34901066,  2.32256409, -5.99787336,  1.48965809])
+    optimization_results_simulation = run_qaoa(hamiltonian_c=hamiltonian_c, hamiltonian_m=hamiltonian_m, initial_guess=initial_guess
                                     , reps=reps, maxiter=maxiter, tol=tol, rhobeg=rhobeg)
     
     # 6. Run QAOA on Real Quantum Device
-
+    # Run once to save the account
+    # QiskitRuntimeService.save_account(
+    #    channel='ibm_quantum',
+    #    instance='',
+    #    token='API_TOKEN',
+    #    overwrite=True)
+    print("----------------------------------------")
+    print("Real quantum device setup")
+    service = QiskitRuntimeService()
+    print(f"backend: {service.backends()}")
+    backend = service.backend('ibm_yonsei')
+    optimization_results_real_quantum_device = run_qaoa_on_real_quantum_device(backend=backend, hamiltonian_c=hamiltonian_c, hamiltonian_m=hamiltonian_m, 
+                                initial_guess=initial_guess, reps=reps, maxiter=maxiter, tol=tol, rhobeg=rhobeg)
+    
 if __name__ == "__main__":
     main()
